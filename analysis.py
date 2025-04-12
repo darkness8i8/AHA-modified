@@ -249,21 +249,10 @@ def compute_entity_stats(df: pd.DataFrame, suffix: str) -> dict:
 def report_entity(name:str, stats:dict):
     q  = stats["questions"]
     sc = stats["score_count"]
-    dist=stats["score_dist"]
-    total=stats["sum_score"]
-    cat = stats["cat_dist"]
-    avg= (total/sc) if sc>0 else 0.0
-
-    # Sort cat keys A..E
-    cat_ordered = {k:cat[k] for k in sorted(cat.keys())}
-    # Sort score keys -1, 0, 1
-    s_ordered = {k:dist[k] for k in ["-1","0","1"]}
-
-    print(f"{name}:")
-    print(f"  Questions: {q}")
-    print(f"  Scores: {sc}")
-    print(f"  Average score: {avg:.3f} {s_ordered}")
-    print(f"  Categories: {cat_ordered}")
+    if sc == 0:
+        return  # Skip reporting if no scores
+    mean = stats["sum_score"]/sc
+    print(f"{name}: {mean:.2f} ({sc}/{q} scored)")
 
 def write_entity_summary(f, name:str, stats:dict):
     q  = stats["questions"]

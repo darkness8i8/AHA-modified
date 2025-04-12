@@ -6,6 +6,7 @@ import argparse, logging, os, random, time, json
 from pathlib import Path
 from typing import List, Dict, Any, Set
 import pandas as pd
+import threading
 
 import nest_asyncio
 nest_asyncio.apply()
@@ -20,10 +21,43 @@ from utils import (
     get_latest_file, combine_csv_files
 )
 
-setup_logging(logging.INFO)
-logging.getLogger("inspect_ai.model").setLevel(logging.INFO)
+# Disable progress display
+os.environ["INSPECT_DISABLE_PROGRESS"] = "1"
+os.environ["INSPECT_DISABLE_CONSOLE"] = "1"
+
+setup_logging(logging.WARNING)
+logging.getLogger("inspect_ai.model").setLevel(logging.WARNING)
 config = None
 dataset_path = None
+
+# Global variables for timer
+timer_running = True
+start_time = None
+total_batches = None
+current_batch = 0
+
+def format_time(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def timer_thread():
+    global timer_running, start_time, total_batches, current_batch
+    last_print = 0
+    while timer_running:
+        current_time = time.time()
+        if current_time - last_print >= 60:  # Print every minute
+            elapsed = current_time - start_time
+            if current_batch > 0 and total_batches > 0:
+                avg_time_per_batch = elapsed / current_batch
+                remaining_batches = total_batches - current_batch
+                estimated_remaining = avg_time_per_batch * remaining_batches
+                print(f"\nProgress: {current_batch}/{total_batches} batches")
+                print(f"Elapsed: {format_time(elapsed)}")
+                print(f"Estimated remaining: {format_time(estimated_remaining)}")
+            last_print = current_time
+        time.sleep(1)
 
 class Config:
     def __init__(self, args):
@@ -155,6 +189,8 @@ def combine_csv_results(conf: Config) -> None:
     logging.info(f"Combined CSV saved to: {outp}")
 
 def main():
+    global timer_running, start_time, total_batches, current_batch
+    
     p = argparse.ArgumentParser("AHA Benchmark")
     p.add_argument("--model", required=True)
     p.add_argument("--openai-base-url", 
@@ -162,7 +198,7 @@ def main():
     p.add_argument("--judges", default="anthropic/claude-3-5-sonnet-20241022,google/gemini-1.5-pro-002,openai/gpt-4o-2024-08-06")
     p.add_argument("--dataset")
     p.add_argument("--output_dir")
-    p.add_argument("--batch_size", type=int, default=100)
+    p.add_argument("--batch_size", type=int, default=20)
     p.add_argument("--num_batches", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--shuffle", action="store_true")
@@ -177,8 +213,8 @@ def main():
 
     global config, dataset_path
     config = Config(args)
-    os.environ["INSPECT_EVAL_MODEL"] = config.model # Set model name globally
-    setup_environment(config) # Setup other env vars
+    os.environ["INSPECT_EVAL_MODEL"] = config.model
+    setup_environment(config)
 
     try:
         full_data = read_json(config.dataset_path)
@@ -189,34 +225,36 @@ def main():
     used_indices = set()
     sampled_files = []
     start_time = time.time()
+    total_batches = config.num_batches
+    current_batch = 0
+
+    # Start timer thread
+    timer = threading.Thread(target=timer_thread)
+    timer.daemon = True
+    timer.start()
 
     try:
         for b in range(config.num_batches):
-            config.current_batch = b + 1
+            current_batch = b + 1
+            print(f"Processing batch {current_batch}/{config.num_batches}...")
             
             sfile = load_and_sample_data(config, full_data, used_indices)
             sampled_files.append(sfile)
             dataset_path = sfile
             
-            # --- Create model_args dictionary ---
             model_args_dict = {}
             if config.model.startswith("vllm/"):
-                logging.info("Preparing model_args for vLLM provider...")
                 model_args_dict = {
                     "max_model_len": 8192,
                     "gpu_memory_utilization": 0.95,
                     "trust_remote_code": True
                 }
-                logging.info(f"Passing model_args to eval(): {model_args_dict}")
-            # ------------------------------------
 
-            logging.info(f"Processing batch {config.current_batch}/{config.num_batches} using dataset: {dataset_path}")
             try:
-                 # Pass model_args dictionary to eval()
-                 eval_result = eval("aha_evaluation", model_args=model_args_dict)
-                 logging.info(f"Finished evaluation for batch {config.current_batch}.")
+                eval_result = eval("aha_evaluation", model_args=model_args_dict)
+                print(f"✓ Batch {current_batch} completed")
             except Exception as e:
-                logging.error(f"Error evaluating batch {config.current_batch}: {e}")
+                logging.error(f"Error evaluating batch {current_batch}: {e}")
                 continue
             
             if config.run_analysis:
@@ -231,30 +269,27 @@ def main():
                     )
                     if config.calculate_judge_harshness:
                         cmd += " --calculate_judge_harshness"
-                    logging.info(f"Results for batch {config.current_batch}:")
                     os.system(cmd)
         
         dt = time.time() - start_time
-        logging.info(f"Total time: {dt:.2f}s")
+        timer_running = False  # Stop the timer thread
+        print(f"\nTotal time: {format_time(dt)}")
         
         if config.run_analysis:
-            logging.info("Combining results...")
+            print("Combining results...")
             combine_csv_results(config)
             cpath = config.output_dir/"combined_results.csv"
             if cpath.exists():
-                logging.info("Final analysis on combined_results.csv...")
+                print("Running final analysis...")
                 cmd = (
                     f"python analysis.py "
                     f"--csv-file {cpath} "
                     f"--output-dir {config.output_dir}"
                 )
-                if config.calculate_judge_harshness:
-                    cmd += " --calculate_judge_harshness"
                 os.system(cmd)
-            else:
-                logging.warning("No combined CSV found.")
     
     finally:
+        timer_running = False  # Ensure timer stops even if there's an error
         for f in sampled_files:
             if f.exists():
                 f.unlink()
